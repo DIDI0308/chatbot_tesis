@@ -1,107 +1,93 @@
 import streamlit as st
-from openai import OpenAI
 from docx import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
 
-# Función para extraer texto de un archivo Word (incluyendo tablas)
-def extract_text_from_docx(file):
-    doc = Document(file)
-    full_text = []
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Buscador Tesis Offline", page_icon="🔍")
+
+# --- FUNCIÓN: LEER DOCUMENTO Y DIVIDIR EN PÁRRAFOS ---
+def procesar_docx(uploaded_file):
+    doc = Document(uploaded_file)
+    chunks = []
     
-    # Extraer párrafos
+    # 1. Extraer párrafos con texto real
     for para in doc.paragraphs:
-        full_text.append(para.text)
-        
-    # Extraer texto de tablas (importante para reportes)
+        texto = para.text.strip()
+        if len(texto) > 30: # Filtramos párrafos muy cortos (títulos vacíos, firmas, etc.)
+            chunks.append(texto)
+            
+    # 2. Extraer tablas
     for table in doc.tables:
         for row in table.rows:
-            row_text = [cell.text for cell in row.cells]
-            full_text.append(" | ".join(row_text))
-            
-    return "\n".join(full_text)
+            row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if row_text:
+                texto_tabla = " | ".join(row_text)
+                if len(texto_tabla) > 20:
+                    chunks.append(f"[Tabla]: {texto_tabla}")
+    
+    return chunks
 
-# Título y configuración
-st.title("🤖 Chatbot Documental")
-st.write(
-    "Sube tu documento Word (.docx) y haz preguntas sobre su contenido. "
-    "Este bot utilizará la información del archivo para responderte."
-)
+# --- FUNCIÓN: BUSCAR LA MEJOR COINCIDENCIA ---
+def encontrar_respuesta(pregunta, lista_textos):
+    # Agregamos la pregunta a la lista de textos para compararla
+    textos_a_comparar = [pregunta] + lista_textos
+    
+    # Convertir texto a números (Vectores TF-IDF)
+    vectorizer = TfidfVectorizer().fit_transform(textos_a_comparar)
+    vectors = vectorizer.toarray()
+    
+    # El vector 0 es la pregunta, el resto son los párrafos del doc
+    csim = cosine_similarity(vectors[0:1], vectors[1:])
+    
+    # Obtener el índice del párrafo con mayor similitud
+    mejor_indice = csim.argmax()
+    score = csim[0][mejor_indice]
+    
+    # Si la coincidencia es muy baja (menor a 0.1), probablemente no hay respuesta
+    if score < 0.1:
+        return None, 0
+        
+    return lista_textos[mejor_indice], score
 
-# Input para la API Key
-openai_api_key = st.text_input("OpenAI API Key", type="password")
+# --- INTERFAZ ---
+st.title("🔍 Buscador Tesis (Sin IA)")
+st.markdown("""
+Este sistema no usa IA (GPT). Busca matemáticamente el párrafo de tu documento 
+que más se parece a tu pregunta. **Es 100% gratis y offline.**
+""")
 
-# 1. Componente para subir el archivo
-uploaded_file = st.file_uploader("Sube tu documento Word aquí", type=["docx"])
+# Carga de archivo
+uploaded_file = st.file_uploader("Sube tu Tesis/Documento (.docx)", type=['docx'])
 
-# Variable para almacenar el contenido del documento en la sesión
-if "document_context" not in st.session_state:
-    st.session_state.document_context = ""
-
-# Procesar el archivo si se sube uno nuevo
+# Lógica principal
 if uploaded_file is not None:
-    try:
-        # Extraer el texto y guardarlo en el estado
-        text_content = extract_text_from_docx(uploaded_file)
-        st.session_state.document_context = text_content
-        st.success(f"✅ Documento procesado con éxito. ¡Ya puedes preguntar!")
+    # Procesar solo una vez
+    if "db_textos" not in st.session_state:
+        with st.spinner("Procesando documento..."):
+            st.session_state.db_textos = procesar_docx(uploaded_file)
+        st.success(f"✅ Documento indexado. Se encontraron {len(st.session_state.db_textos)} fragmentos.")
+
+    # Chat input
+    if pregunta := st.chat_input("Escribe tu pregunta exacta..."):
         
-        # Opcional: Mostrar un poco del texto extraído para verificar (oculto en un expander)
-        with st.expander("Ver contenido extraído"):
-            st.write(text_content[:1000] + "...") # Muestra los primeros 1000 caracteres
-            
-    except Exception as e:
-        st.error(f"Error al leer el archivo: {e}")
-
-# Verificación de API Key
-if not openai_api_key:
-    st.info("Por favor ingresa tu OpenAI API Key para continuar.", icon="🗝️")
-else:
-    client = OpenAI(api_key=openai_api_key)
-
-    # Inicializar historial de chat
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    # Mostrar mensajes previos
-    for message in st.session_state.messages:
-        # No mostramos el mensaje del sistema (el contexto) al usuario final
-        if message["role"] != "system":
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-
-    # Input del usuario
-    if prompt := st.chat_input("Pregunta algo sobre el documento..."):
-
-        # Guardar y mostrar mensaje del usuario
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        # Mostrar pregunta usuario
         with st.chat_message("user"):
-            st.markdown(prompt)
-
-        # 2. Construir la lista de mensajes con el contexto del documento
-        # Si hay un documento cargado, lo añadimos como instrucción del sistema
-        messages_to_send = []
+            st.markdown(pregunta)
+            
+        # Buscar respuesta
+        respuesta, score = encontrar_respuesta(pregunta, st.session_state.db_textos)
         
-        if st.session_state.document_context:
-            system_prompt = {
-                "role": "system", 
-                "content": f"Eres un asistente útil. Responde a las preguntas del usuario basándote ÚNICAMENTE en el siguiente contexto extraído de un documento:\n\n{st.session_state.document_context}"
-            }
-            messages_to_send.append(system_prompt)
-        else:
-            # Si no hay doc, actúa como un bot normal
-            messages_to_send.append({"role": "system", "content": "Eres un asistente útil."})
-
-        # Añadir el historial de la conversación (para que tenga memoria)
-        messages_to_send.extend(st.session_state.messages)
-
-        # Generar respuesta
-        stream = client.chat.completions.create(
-            model="gpt-4o-mini", # Usamos gpt-4o-mini porque soporta textos mucho más largos que 3.5
-            messages=messages_to_send,
-            stream=True,
-        )
-
-        # Mostrar respuesta
+        # Mostrar respuesta sistema
         with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        
-        st.session_state.messages.append({"role": "assistant", "content": response})
+            if respuesta:
+                st.markdown(f"**Encontré esto en el documento** (Coincidencia: {int(score*100)}%):")
+                st.info(respuesta)
+            else:
+                st.warning("No encontré ningún párrafo en el documento que hable de eso. Intenta usar palabras clave específicas.")
+
+else:
+    # Limpiar memoria si quitan el archivo
+    if "db_textos" in st.session_state:
+        del st.session_state.db_textos
